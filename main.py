@@ -1369,3 +1369,261 @@ def main():
         visualization_engine = VisualizationEngine(data_processor)
         
         if not backtest_results:
+            logger.info("Running backtests for dashboard")
+            for symbol in args.symbols:
+                if symbol in data:
+                    backtest_results[symbol] = {}
+                    ma_df = strategies.moving_average_crossover(symbol)
+                    ma_backtest, ma_metrics = strategies.backtest_strategy(symbol, ma_df)
+                    backtest_results[symbol]['ma_crossover'] = (ma_backtest, ma_metrics)
+                    rsi_df = strategies.rsi_strategy(symbol)
+                    rsi_backtest, rsi_metrics = strategies.backtest_strategy(symbol, rsi_df)
+                    backtest_results[symbol]['rsi'] = (rsi_backtest, rsi_metrics)
+                    if symbol in model_builder.models:
+                        ml_df = strategies.ml_based_strategy(symbol)
+                        ml_backtest, ml_metrics = strategies.backtest_strategy(symbol, ml_df)
+                        backtest_results[symbol]['ml'] = (ml_backtest, ml_metrics)
+                    ensemble_df = strategies.ensemble_strategy(symbol)
+                    ensemble_backtest, ensemble_metrics = strategies.backtest_strategy(symbol, ensemble_df)
+                    backtest_results[symbol]['ensemble'] = (ensemble_backtest, ensemble_metrics)
+        strategy_names = list(backtest_results[args.symbols[0]].keys()) if backtest_results and args.symbols else []
+        app = visualization_engine.create_dashboard(args.symbols, strategy_names, backtest_results)
+        logger.info("Dashboard available at http://127.0.0.1:8050/")
+        app.run_server(debug=True, port=8050)
+    else:
+        logger.info("Platform execution complete. Summary:")
+        logger.info(f"Symbols processed: {len(data)}")
+        logger.info(f"Models trained: {len(model_builder.models)}")
+        if backtest_results:
+            logger.info("\nBacktest Results Summary:")
+            for symbol, strategies_results in backtest_results.items():
+                logger.info(f"\n{symbol}:")
+                for strategy, (_, metrics) in strategies_results.items():
+                    logger.info(f"  {strategy}: Total Return: {metrics.get('total_return', 'N/A'):.2%}, "
+                              f"Sharpe Ratio: {metrics.get('sharpe_ratio', 'N/A'):.2f}")
+        if predictions:
+            logger.info(f"\nPredictions generated for {len(predictions)} symbols")
+            for symbol, pred_df in predictions.items():
+                logger.info(f"{symbol}: Next prediction: ${pred_df['PredictedPrice'].iloc[0]:.2f}")
+if __name__ == "__main__":
+    main()
+def load_config(config_file='config.json'):
+    try:
+        with open(config_file, 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        logger.warning(f"Config file {config_file} not found. Using defaults.")
+        return {}
+def save_results(results, filename):
+    try:
+        with open(filename, 'wb') as f:
+            pickle.dump(results, f)
+        logger.info(f"Results saved to {filename}")
+    except Exception as e:
+        logger.error(f"Error saving results: {e}")
+def load_results(filename):
+    try:
+        with open(filename, 'rb') as f:
+            return pickle.load(f)
+    except FileNotFoundError:
+        logger.warning(f"Results file {filename} not found")
+        return None
+    except Exception as e:
+        logger.error(f"Error loading results: {e}")
+        return None
+def create_model_checkpoint_callback(filepath):
+    return ModelCheckpoint(
+        filepath=filepath,
+        monitor='val_loss',
+        save_best_only=True,
+        save_weights_only=False,
+        mode='min',
+        verbose=1
+    )
+def create_early_stopping_callback(patience=10):
+    return EarlyStopping(
+        monitor='val_loss',
+        patience=patience,
+        restore_best_weights=True,
+        verbose=1
+    )
+def create_reduce_lr_callback(patience=5):
+    return ReduceLROnPlateau(
+        monitor='val_loss',
+        factor=0.5,
+        patience=patience,
+        min_lr=1e-7,
+        verbose=1
+    )
+class RiskManager:
+    def __init__(self, max_position_size=0.1, max_portfolio_volatility=0.2):
+        self.max_position_size = max_position_size
+        self.max_portfolio_volatility = max_portfolio_volatility
+        self.logger = logging.getLogger(__name__)
+    def calculate_position_size(self, symbol, current_price, account_value, volatility):
+        if volatility > 0:
+            base_size = min(self.max_position_size, 1 / (volatility * np.sqrt(252)))
+        else:
+            base_size = self.max_position_size
+        max_dollar_amount = account_value * base_size
+        shares = int(max_dollar_amount / current_price)
+        return shares
+    def calculate_stop_loss(self, entry_price, volatility, atr_multiplier=2.0):
+        stop_loss = entry_price * (1 - atr_multiplier * volatility)
+        return stop_loss
+    def calculate_take_profit(self, entry_price, stop_loss, risk_reward_ratio=2.0):
+        risk = entry_price - stop_loss
+        take_profit = entry_price + (risk * risk_reward_ratio)
+        return take_profit
+    def check_portfolio_risk(self, positions, returns_data):
+        if not positions:
+            return True
+        weights = np.array([pos['weight'] for pos in positions])
+        symbols = [pos['symbol'] for pos in positions]
+        portfolio_returns = []
+        for symbol in symbols:
+            if symbol in returns_data:
+                portfolio_returns.append(returns_data[symbol])
+        if len(portfolio_returns) < 2:
+            return True
+        returns_matrix = np.column_stack(portfolio_returns)
+        cov_matrix = np.cov(returns_matrix.T)
+        portfolio_variance = np.dot(weights, np.dot(cov_matrix, weights))
+        portfolio_volatility = np.sqrt(portfolio_variance * 252)  
+        return portfolio_volatility <= self.max_portfolio_volatility
+class PerformanceAnalyzer:
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+    def calculate_advanced_metrics(self, returns, benchmark_returns=None):
+        if len(returns) == 0:
+            return {}
+        total_return = (1 + returns).prod() - 1
+        annualized_return = (1 + returns).prod() ** (252 / len(returns)) - 1
+        volatility = returns.std() * np.sqrt(252)
+        sharpe_ratio = annualized_return / volatility if volatility > 0 else 0
+        cumulative = (1 + returns).cumprod()
+        running_max = cumulative.expanding().max()
+        drawdown = (cumulative - running_max) / running_max
+        max_drawdown = drawdown.min()
+        downside_returns = returns[returns < 0]
+        downside_volatility = downside_returns.std() * np.sqrt(252)
+        sortino_ratio = annualized_return / downside_volatility if downside_volatility > 0 else 0
+        calmar_ratio = annualized_return / abs(max_drawdown) if max_drawdown != 0 else 0
+        win_rate = (returns > 0).mean()
+        wins = returns[returns > 0]
+        losses = returns[returns < 0]
+        avg_win = wins.mean() if len(wins) > 0 else 0
+        avg_loss = losses.mean() if len(losses) > 0 else 0
+        profit_factor = abs(wins.sum() / losses.sum()) if losses.sum() != 0 else np.inf
+        metrics = {
+            'total_return': total_return,
+            'annualized_return': annualized_return,
+            'volatility': volatility,
+            'sharpe_ratio': sharpe_ratio,
+            'sortino_ratio': sortino_ratio,
+            'calmar_ratio': calmar_ratio,
+            'max_drawdown': max_drawdown,
+            'win_rate': win_rate,
+            'avg_win': avg_win,
+            'avg_loss': avg_loss,
+            'profit_factor': profit_factor,
+        }
+        if benchmark_returns is not None and len(benchmark_returns) == len(returns):
+            benchmark_return = (1 + benchmark_returns).prod() - 1
+            excess_returns = returns - benchmark_returns
+            tracking_error = excess_returns.std() * np.sqrt(252)
+            information_ratio = excess_returns.mean() / excess_returns.std() * np.sqrt(252) if excess_returns.std() > 0 else 0
+            metrics.update({
+                'benchmark_return': benchmark_return,
+                'excess_return': total_return - benchmark_return,
+                'tracking_error': tracking_error,
+                'information_ratio': information_ratio,
+            })
+        return metrics
+    def monte_carlo_simulation(self, returns, num_simulations=1000, days_ahead=252):
+        if len(returns) == 0:
+            return None
+        mean_return = returns.mean()
+        std_return = returns.std()
+        simulations = []
+        for _ in range(num_simulations):
+            random_returns = np.random.normal(mean_return, std_return, days_ahead)
+            cumulative_return = (1 + random_returns).prod() - 1
+            simulations.append(cumulative_return)
+        percentiles = np.percentile(simulations, [5, 25, 50, 75, 95])
+        return {
+            'simulations': simulations,
+            'percentiles': {
+                '5th': percentiles[0],
+                '25th': percentiles[1],
+                '50th': percentiles[2],
+                '75th': percentiles[3],
+                '95th': percentiles[4],
+            },
+            'mean': np.mean(simulations),
+            'std': np.std(simulations),
+        }
+DEFAULT_CONFIG = {
+    'data': {
+        'symbols': ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA'],
+        'start_date': '2020-01-01',
+        'lookback_period': 252,
+    },
+    'model': {
+        'sequence_length': 60,
+        'lstm_units': [128, 64],
+        'dense_units': [32, 16],
+        'dropout_rate': 0.3,
+        'learning_rate': 0.001,
+        'batch_size': 32,
+        'epochs': 100,
+        'validation_split': 0.2,
+    },
+    'trading': {
+        'initial_capital': 100000,
+        'commission': 0.001,
+        'slippage': 0.0005,
+        'max_position_size': 0.1,
+        'risk_free_rate': 0.02,
+    },
+    'technical_indicators': {
+        'sma_periods': [10, 20, 50],
+        'ema_periods': [12, 26],
+        'rsi_period': 14,
+        'macd_periods': [12, 26, 9],
+        'bollinger_period': 20,
+        'bollinger_std': 2,
+        'atr_period': 14,
+    },
+    'optimization': {
+        'n_trials': 100,
+        'timeout': 3600,  
+        'pruning': True,
+    },
+    'visualization': {
+        'plot_height': 600,
+        'plot_width': 1200,
+        'template': 'plotly_white',
+    },
+}
+def get_config():
+    config = DEFAULT_CONFIG.copy()
+    file_config = load_config()
+    if file_config:
+        for key, value in file_config.items():
+            if key in config and isinstance(config[key], dict):
+                config[key].update(value)
+            else:
+                config[key] = value
+    return config
+__all__ = [
+    'DataProcessor',
+    'ModelBuilder', 
+    'TradingStrategies',
+    'VisualizationEngine',
+    'PredictionEngine',
+    'RiskManager',
+    'PerformanceAnalyzer',
+    'main',
+    'get_config'
+]
